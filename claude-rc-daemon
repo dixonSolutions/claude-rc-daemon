@@ -129,6 +129,7 @@ class Config:
     stop_grace_seconds: float = 10.0
     log_dir: Path = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "claude-rc-daemon" / "logs"
     settings_template: Path | None = DEFAULT_CONFIG.with_name("settings.local.json")
+    auto_trust: bool = False
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -147,6 +148,7 @@ class Config:
             reconcile_interval=float(raw.get("reconcile_interval", 60)),
             stagger_seconds=float(raw.get("stagger_seconds", 3)),
             stop_grace_seconds=float(raw.get("stop_grace_seconds", 10)),
+            auto_trust=bool(raw.get("auto_trust", False)),
             **({"log_dir": Path(raw["log_dir"]).expanduser()} if "log_dir" in raw else {}),
             **({"settings_template": Path(raw["settings_template"]).expanduser() if raw["settings_template"] else None}
                if "settings_template" in raw else {}),
@@ -267,7 +269,7 @@ def trusted_paths() -> set[Path]:
 
 def grant_trust(paths: list[Path]) -> None:
     """Record trust for the given folders, exactly as accepting the dialog in each would.
-    Only ever invoked by the explicit `--trust --yes` command, never by the daemon loop."""
+    Invoked by the explicit `--trust` command, or by the loop when `auto_trust = true`."""
     data = _read_claude_json()
     projects = data.setdefault("projects", {})
     for p in paths:
@@ -350,11 +352,21 @@ class Daemon:
 
         # Untrusted folders would just print "Workspace not trusted" and exit; do not start them.
         untrusted = [p for p in desired if p not in trusted and p not in running]
+        if untrusted and self.cfg.auto_trust:
+            # The user opted in by listing the hot path in the config; treat that as accepting the
+            # workspace-trust dialog for every project folder found directly inside it.
+            if self.dry_run:
+                LOG.info("[dry-run] would record trust for: %s", ", ".join(p.name for p in untrusted))
+            else:
+                grant_trust(untrusted)
+                LOG.info("auto_trust: recorded trust for %s", ", ".join(p.name for p in untrusted))
+                trusted = trusted_paths()
+                untrusted = [p for p in desired if p not in trusted and p not in running]
         new_untrusted = [p for p in untrusted if p not in self.warned_untrusted]
         if new_untrusted:
             self.warned_untrusted.update(new_untrusted)
             LOG.warning("%d project(s) not yet trusted, skipping: %s. Run `claude-rc-daemon --trust` to "
-                        "accept them all at once, or `claude` once in each folder.",
+                        "accept them all at once, set auto_trust = true, or run `claude` once in each folder.",
                         len(new_untrusted), ", ".join(p.name for p in new_untrusted))
         desired = {p: pr for p, pr in desired.items() if p not in untrusted}
 

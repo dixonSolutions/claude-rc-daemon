@@ -10,4 +10,8 @@ ln -sfn "$HERE/claude-rc-daemon" "$BIN/claude-rc-daemon"
 cp "$HERE/claude-rc-daemon.service" "$UNITS/claude-rc-daemon.service"
 systemctl --user daemon-reload
 systemctl --user enable --now claude-rc-daemon.service
-echo "installed. edit $CFG/config.toml, then run: claude-rc-daemon --trust"
+loginctl enable-linger "$USER" 2>/dev/null || true   # start at boot, not only at login
+# Accept workspace trust for every project found now, so the first rollout does not stall.
+# Later folders are handled by auto_trust = true in the config.
+"$BIN/claude-rc-daemon" --trust --yes
+echo "installed. config: $CFG/config.toml   status: claude-rc-daemon --status"

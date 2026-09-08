@@ -29,27 +29,23 @@ keeps a server running in a tmux session named `rc-<folder>`.
 ```bash
 git clone git@github.com:dixonSolutions/claude-rc-daemon.git ~/Projects/claude-rc-daemon
 ~/Projects/claude-rc-daemon/install.sh
-loginctl enable-linger "$USER"   # user services start at boot, not only at login
 ```
 
 `install.sh` links the script into `~/.local/bin`, copies the example config and settings
-template to `~/.config/claude-rc-daemon/` if they are not there yet, installs the user unit, and
-enables it.
-
-Then, once:
-
-```bash
-claude-rc-daemon --trust    # accept the workspace-trust dialog for every tracked folder
-```
+template to `~/.config/claude-rc-daemon/` if they are not there yet, installs and enables the
+user unit, turns on linger, and accepts workspace trust for every project it finds.
 
 Claude Code refuses to serve a folder whose trust dialog was never accepted, and trust does not
-inherit from a parent folder. `--trust` lists the folders and asks before writing.
+inherit from a parent folder. With `auto_trust = true` (the default in the example config) the
+daemon records trust for any new project folder it discovers under a hot path, so a fresh
+`git clone` is served within a minute with no further steps. Set it to `false` if you want to
+approve folders yourself with `claude-rc-daemon --trust`, which lists them and asks first.
 
 ## Daily use
 
 ```bash
 claude-rc-daemon --status            # running / untrusted / missing / stray, per folder
-claude-rc-daemon --trust             # after adding a new project folder
+claude-rc-daemon --trust             # only needed when auto_trust = false
 journalctl --user -u claude-rc-daemon -f
 ls ~/.local/state/claude-rc-daemon/logs/   # each server's terminal output
 tmux attach -t rc-<folder>           # the server's own screen (QR code, session link)
@@ -63,6 +59,7 @@ tmux attach -t rc-<folder>           # the server's own screen (QR code, session
 hot_paths = ["~/Projects", "~/Projects/ZuraSolutions"]
 exclude   = ["SideProjects"]
 claude_args = ["--no-sandbox"]
+auto_trust = true
 ```
 
 A hot path is never treated as a project itself, which is how a nested container like

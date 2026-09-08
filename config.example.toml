@@ -19,6 +19,11 @@ require_git = true
 # Extra flags appended to every `claude remote-control` invocation.
 claude_args = ["--no-sandbox"]
 
+# Accept the Claude Code workspace-trust dialog automatically for every project folder found
+# directly inside a hot path. Listing the hot path is the opt-in. Without this, new folders sit
+# in "untrusted" until you run `claude-rc-daemon --trust`.
+auto_trust = true
+
 # session_prefix = "rc-"        # tmux session name prefix
 # settle_seconds = 10           # wait after a folder event before reconciling (lets git clone finish)
 # reconcile_interval = 60       # periodic full scan, catches anything inotify missed
