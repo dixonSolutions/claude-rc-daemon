@@ -4,14 +4,12 @@
 # A hot path is never a project itself, so listing ~/Projects/ZuraSolutions here both
 # tracks its children and stops ~/Projects from treating it as one.
 
-hot_paths = [
-  "~/Projects",
-  "~/Projects/ZuraSolutions",
-]
+# Default when omitted: ["~/Projects"]. Add a nested folder that only *holds* projects
+# (e.g. "~/Projects/Work") to serve its children; a hot path is never served as a project itself.
+hot_paths = ["~/Projects"]
 
 # Sub-folders to ignore. A bare name matches in any hot path; a path matches exactly.
-# SideProjects holds older copies of top-level projects and is not a project itself.
-exclude = ["SideProjects"]
+exclude = []
 
 # Only folders containing .git are projects. Set false to also serve plain folders (same-dir mode).
 require_git = true

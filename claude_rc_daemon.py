@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """claude-rc-daemon: keep one `claude remote-control` server alive per project folder.
 
-Config (TOML) lists *hot paths*. Every immediate sub-folder of a hot path is a
+Config (TOML) lists *hot paths*; with none set, ~/Projects is used. Every immediate sub-folder of a hot path is a
 candidate project; loose files in the hot path are ignored. A sub-folder is:
 
   * skipped   if it is itself a hot path (or an ancestor of one), is excluded by
@@ -43,6 +43,7 @@ from pathlib import Path
 LOG = logging.getLogger("claude-rc-daemon")
 DEFAULT_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "claude-rc-daemon" / "config.toml"
 CLAUDE_JSON = Path("~/.claude.json").expanduser()
+DEFAULT_HOT_PATHS = ["~/Projects"]  # used when the config sets no hot_paths
 
 # ---------------------------------------------------------------- inotify (ctypes)
 IN_CREATE = 0x00000100
@@ -135,9 +136,7 @@ class Config:
     def load(cls, path: Path) -> "Config":
         with open(path, "rb") as fh:
             raw = tomllib.load(fh)
-        hot = [Path(p).expanduser().resolve() for p in raw.get("hot_paths", [])]
-        if not hot:
-            raise SystemExit(f"{path}: hot_paths is empty")
+        hot = [Path(p).expanduser().resolve() for p in raw.get("hot_paths", []) or DEFAULT_HOT_PATHS]
         return cls(
             hot_paths=hot,
             exclude=list(raw.get("exclude", [])),

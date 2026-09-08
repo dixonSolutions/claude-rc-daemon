@@ -56,14 +56,15 @@ tmux attach -t rc-<folder>           # the server's own screen (QR code, session
 `~/.config/claude-rc-daemon/config.toml`, see [config.example.toml](config.example.toml).
 
 ```toml
-hot_paths = ["~/Projects", "~/Projects/ZuraSolutions"]
-exclude   = ["SideProjects"]
+hot_paths = ["~/Projects"]          # the default when omitted
+exclude   = []
 claude_args = ["--no-sandbox"]
 auto_trust = true
 ```
 
-A hot path is never treated as a project itself, which is how a nested container like
-`~/Projects/ZuraSolutions` gets its children served without being served as one.
+A hot path is never treated as a project itself. If a folder inside `~/Projects` only holds
+projects, add it too, e.g. `hot_paths = ["~/Projects", "~/Projects/Work"]`, and its children are
+served while it is not.
 
 ## Per-project settings template
 
@@ -82,7 +83,7 @@ choices. See issue #1 for making this a daemon command.
 
 | Path | Purpose |
 |---|---|
-| `claude-rc-daemon` | the daemon, single file |
+| `claude_rc_daemon.py` | the daemon, single Python file (linked to `~/.local/bin/claude-rc-daemon`) |
 | `config.example.toml` | annotated config |
 | `settings.local.example.json` | per-project Claude Code permissions template |
 | `claude-rc-daemon.service` | systemd user unit |
