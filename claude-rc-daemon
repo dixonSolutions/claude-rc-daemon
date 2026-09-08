@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""claude-rc-daemon: keep one `claude remote-control` server alive per project folder.
+
+Config (TOML) lists *hot paths*. Every immediate sub-folder of a hot path is a
+candidate project; loose files in the hot path are ignored. A sub-folder is:
+
+  * skipped   if it is itself a hot path (or an ancestor of one), is excluded by
+              name/path, or starts with a dot;
+  * a project if it contains `.git`;
+  * a container (skipped, hinted once) if it has no `.git` but holds sub-folders
+              that do -- e.g. ~/Projects/SideProjects. Add it as a hot path or exclude it.
+  * skipped   otherwise when `require_git = true` (default).
+
+Each project gets a detached tmux session running
+`claude remote-control --name <folder> --spawn worktree <claude_args...>`.
+The daemon watches hot paths with inotify (non-recursive, directory events only)
+and reconciles desired vs running on every event and on a periodic timer.
+Servers whose folder disappeared are stopped. Servers already running for a
+project (any tmux session, any name) are adopted, never duplicated.
+
+The daemon never deletes anything on disk.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import hashlib
+import json
+import logging
+import os
+import select
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import time
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+LOG = logging.getLogger("claude-rc-daemon")
+DEFAULT_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "claude-rc-daemon" / "config.toml"
+CLAUDE_JSON = Path("~/.claude.json").expanduser()
+
+# ---------------------------------------------------------------- inotify (ctypes)
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_ISDIR = 0x40000000
+IN_IGNORED = 0x00008000
+IN_ONLYDIR = 0x01000000
+IN_EXCL_UNLINK = 0x04000000
+IN_NONBLOCK = 0o4000
+IN_CLOEXEC = 0o2000000
+WATCH_MASK = (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO
+              | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR | IN_EXCL_UNLINK)
+_EVENT_HDR = struct.Struct("iIII")
+
+
+class Inotify:
+    """Minimal non-recursive inotify wrapper. Only directory events reach the caller."""
+
+    def __init__(self) -> None:
+        self._libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        self.fd = self._libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+        self.wd_to_path: dict[int, Path] = {}
+        self.path_to_wd: dict[Path, int] = {}
+
+    def add(self, path: Path) -> bool:
+        if path in self.path_to_wd:
+            return True
+        wd = self._libc.inotify_add_watch(self.fd, str(path).encode(), WATCH_MASK)
+        if wd < 0:
+            LOG.warning("cannot watch %s: %s", path, os.strerror(ctypes.get_errno()))
+            return False
+        self.wd_to_path[wd] = path
+        self.path_to_wd[path] = wd
+        LOG.info("watching %s", path)
+        return True
+
+    def _forget(self, wd: int) -> None:
+        path = self.wd_to_path.pop(wd, None)
+        if path is not None:
+            self.path_to_wd.pop(path, None)
+            LOG.warning("hot path went away: %s (will re-watch when it returns)", path)
+
+    def drain(self) -> bool:
+        """Read all pending events. Returns True if any relevant (directory) event was seen."""
+        relevant = False
+        while True:
+            try:
+                buf = os.read(self.fd, 65536)
+            except BlockingIOError:
+                return relevant
+            off = 0
+            while off < len(buf):
+                wd, mask, _cookie, length = _EVENT_HDR.unpack_from(buf, off)
+                off += _EVENT_HDR.size
+                name = buf[off:off + length].split(b"\0", 1)[0].decode(errors="replace")
+                off += length
+                if mask & IN_IGNORED:
+                    self._forget(wd)
+                    relevant = True
+                elif mask & (IN_DELETE_SELF | IN_MOVE_SELF):
+                    relevant = True
+                elif mask & IN_ISDIR and not name.startswith("."):
+                    relevant = True   # create/delete/move of a sub-folder
+                # plain-file events are dropped here: "lonely files" never trigger work
+
+
+# ---------------------------------------------------------------- config
+@dataclass
+class Config:
+    hot_paths: list[Path]
+    exclude: list[str] = field(default_factory=list)
+    require_git: bool = True
+    claude_args: list[str] = field(default_factory=list)
+    session_prefix: str = "rc-"
+    settle_seconds: float = 10.0
+    reconcile_interval: float = 60.0
+    stagger_seconds: float = 3.0
+    stop_grace_seconds: float = 10.0
+    log_dir: Path = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "claude-rc-daemon" / "logs"
+    settings_template: Path | None = DEFAULT_CONFIG.with_name("settings.local.json")
+
+    @classmethod
+    def load(cls, path: Path) -> "Config":
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
+        hot = [Path(p).expanduser().resolve() for p in raw.get("hot_paths", [])]
+        if not hot:
+            raise SystemExit(f"{path}: hot_paths is empty")
+        return cls(
+            hot_paths=hot,
+            exclude=list(raw.get("exclude", [])),
+            require_git=bool(raw.get("require_git", True)),
+            claude_args=list(raw.get("claude_args", [])),
+            session_prefix=str(raw.get("session_prefix", "rc-")),
+            settle_seconds=float(raw.get("settle_seconds", 10)),
+            reconcile_interval=float(raw.get("reconcile_interval", 60)),
+            stagger_seconds=float(raw.get("stagger_seconds", 3)),
+            stop_grace_seconds=float(raw.get("stop_grace_seconds", 10)),
+            **({"log_dir": Path(raw["log_dir"]).expanduser()} if "log_dir" in raw else {}),
+            **({"settings_template": Path(raw["settings_template"]).expanduser() if raw["settings_template"] else None}
+               if "settings_template" in raw else {}),
+        )
+
+    def is_excluded(self, p: Path) -> bool:
+        for e in self.exclude:
+            if "/" in e or e.startswith("~"):
+                if Path(e).expanduser().resolve() == p:
+                    return True
+            elif p.name == e:
+                return True
+        return False
+
+
+# ---------------------------------------------------------------- discovery
+@dataclass(frozen=True)
+class Project:
+    path: Path
+    git: bool
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def spawn_mode(self) -> str:
+        return "worktree" if self.git else "same-dir"
+
+
+def _is_git(p: Path) -> bool:
+    return (p / ".git").exists()
+
+
+def _is_container(p: Path) -> bool:
+    try:
+        return any(c.is_dir() and not c.name.startswith(".") and _is_git(c) for c in p.iterdir())
+    except OSError:
+        return False
+
+
+def discover(cfg: Config, hinted: set[Path]) -> dict[Path, Project]:
+    """Scan hot paths and return the desired project set. `hinted` dedupes container hints."""
+    found: dict[Path, Project] = {}
+    for hot in cfg.hot_paths:
+        if not hot.is_dir():
+            continue
+        try:
+            entries = sorted(hot.iterdir())
+        except OSError as exc:
+            LOG.warning("cannot list %s: %s", hot, exc)
+            continue
+        for entry in entries:
+            if entry.name.startswith(".") or not entry.is_dir() or entry.is_symlink():
+                continue  # lonely files, dot-dirs and symlinks are ignored
+            p = entry.resolve()
+            if any(p == h or p in h.parents for h in cfg.hot_paths):
+                continue  # a hot path (or its ancestor) is never a project itself
+            if cfg.is_excluded(p):
+                continue
+            if _is_git(p):
+                found[p] = Project(p, True)
+            elif _is_container(p):
+                if p not in hinted:
+                    hinted.add(p)
+                    LOG.warning("skipping container %s: holds git projects but is not one. "
+                                "Add it to hot_paths or exclude it.", p)
+            elif not cfg.require_git:
+                found[p] = Project(p, False)
+    return found
+
+
+# ---------------------------------------------------------------- running servers
+@dataclass
+class Server:
+    pid: int
+    cwd: Path
+    cwd_deleted: bool
+
+
+def running_servers() -> dict[Path, Server]:
+    """Every `claude remote-control` server process on the box, keyed by its cwd."""
+    out: dict[Path, Server] = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+            cwd_raw = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        if len(argv) < 2 or os.path.basename(argv[0].decode(errors="replace")) != "claude":
+            continue
+        if argv[1] != b"remote-control" or b"--help" in argv:
+            continue
+        deleted = cwd_raw.endswith(" (deleted)")
+        cwd = Path(cwd_raw[:-10] if deleted else cwd_raw)
+        out.setdefault(cwd, Server(pid, cwd, deleted))
+    return out
+
+
+# ---------------------------------------------------------------- workspace trust
+def _read_claude_json() -> dict:
+    try:
+        return json.loads(CLAUDE_JSON.read_text()) if CLAUDE_JSON.exists() else {}
+    except (OSError, ValueError) as exc:
+        LOG.warning("cannot read %s: %s", CLAUDE_JSON, exc)
+        return {}
+
+
+def trusted_paths() -> set[Path]:
+    """Folders whose workspace-trust dialog has been accepted. `claude remote-control` refuses others."""
+    projects = _read_claude_json().get("projects", {})
+    return {Path(p) for p, v in projects.items() if isinstance(v, dict) and v.get("hasTrustDialogAccepted") is True}
+
+
+def grant_trust(paths: list[Path]) -> None:
+    """Record trust for the given folders, exactly as accepting the dialog in each would.
+    Only ever invoked by the explicit `--trust --yes` command, never by the daemon loop."""
+    data = _read_claude_json()
+    projects = data.setdefault("projects", {})
+    for p in paths:
+        projects.setdefault(str(p), {})["hasTrustDialogAccepted"] = True
+    backup = CLAUDE_JSON.with_name(".claude.json.rc-daemon.bak")
+    if CLAUDE_JSON.exists():
+        backup.write_bytes(CLAUDE_JSON.read_bytes())
+    tmp = CLAUDE_JSON.with_name(".claude.json.rc-daemon.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CLAUDE_JSON)
+
+
+# ---------------------------------------------------------------- actions
+def session_name(cfg: Config, project: Project, taken: set[str]) -> str:
+    base = cfg.session_prefix + project.name
+    if base not in taken:
+        return base
+    return f"{base}-{hashlib.sha1(str(project.path).encode()).hexdigest()[:6]}"
+
+
+def tmux_sessions() -> set[str]:
+    r = subprocess.run(["tmux", "ls", "-F", "#S"], capture_output=True, text=True)
+    return set(r.stdout.split()) if r.returncode == 0 else set()
+
+
+def start(cfg: Config, project: Project, taken: set[str], dry_run: bool) -> None:
+    sess = session_name(cfg, project, taken)
+    cmd = ["claude", "remote-control", "--name", project.name, "--spawn", project.spawn_mode, *cfg.claude_args]
+    if dry_run:
+        LOG.info("[dry-run] would start %s in %s: %s", sess, project.path, shlex.join(cmd))
+        return
+    subprocess.run(["tmux", "new", "-d", "-s", sess, "-c", str(project.path), shlex.join(cmd)], check=True)
+    taken.add(sess)
+    # Mirror the pane to a log file so an early exit (auth, eligibility, trust prompt) stays diagnosable.
+    try:
+        cfg.log_dir.mkdir(parents=True, exist_ok=True)
+        logfile = cfg.log_dir / f"{sess}.log"
+        subprocess.run(["tmux", "pipe-pane", "-t", sess, "-o", f"cat >> {shlex.quote(str(logfile))}"], check=False)
+    except OSError as exc:
+        LOG.warning("cannot set up log for %s: %s", sess, exc)
+    LOG.info("started %s for %s (%s)", sess, project.path, project.spawn_mode)
+
+
+def stop(server: Server, cfg: Config, dry_run: bool) -> None:
+    why = "folder deleted" if server.cwd_deleted else "no longer a tracked project"
+    if dry_run:
+        LOG.info("[dry-run] would stop pid %d in %s (%s)", server.pid, server.cwd, why)
+        return
+    LOG.info("stopping pid %d in %s (%s)", server.pid, server.cwd, why)
+    try:
+        os.kill(server.pid, signal.SIGINT)
+        deadline = time.monotonic() + cfg.stop_grace_seconds
+        while time.monotonic() < deadline:
+            os.kill(server.pid, 0)
+            time.sleep(0.2)
+        os.kill(server.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+# ---------------------------------------------------------------- reconcile loop
+class Daemon:
+    def __init__(self, cfg: Config, dry_run: bool) -> None:
+        self.cfg = cfg
+        self.dry_run = dry_run
+        self.hinted: set[Path] = set()
+        self.failures: dict[Path, int] = {}
+        self.next_allowed: dict[Path, float] = {}
+        self.started_at: dict[Path, float] = {}
+        self.stopping = False
+        self.warned_untrusted: set[Path] = set()
+
+    def reconcile(self) -> None:
+        desired = discover(self.cfg, self.hinted)
+        running = running_servers()
+        now = time.monotonic()
+        taken = tmux_sessions()
+        trusted = trusted_paths()
+
+        # Untrusted folders would just print "Workspace not trusted" and exit; do not start them.
+        untrusted = [p for p in desired if p not in trusted and p not in running]
+        new_untrusted = [p for p in untrusted if p not in self.warned_untrusted]
+        if new_untrusted:
+            self.warned_untrusted.update(new_untrusted)
+            LOG.warning("%d project(s) not yet trusted, skipping: %s. Run `claude-rc-daemon --trust` to "
+                        "accept them all at once, or `claude` once in each folder.",
+                        len(new_untrusted), ", ".join(p.name for p in new_untrusted))
+        desired = {p: pr for p, pr in desired.items() if p not in untrusted}
+
+        # Stop servers whose folder vanished, or that sit directly under a hot path without being a
+        # tracked project (a container like SideProjects, or an excluded folder). Servers you started
+        # by hand deeper in the tree, or outside the hot paths, are left alone.
+        for cwd, srv in running.items():
+            if srv.cwd_deleted or (cwd.parent in self.cfg.hot_paths and cwd not in desired
+                                   and cwd not in self.cfg.hot_paths):
+                stop(srv, self.cfg, self.dry_run)
+
+        # Start what is missing, with back-off for servers that keep dying.
+        started_any = False
+        for path, project in desired.items():
+            if path in running and not running[path].cwd_deleted:
+                if path in self.started_at and now - self.started_at[path] > 120:
+                    self.failures.pop(path, None)
+                    self.next_allowed.pop(path, None)
+                    self.started_at.pop(path, None)
+                continue
+            if path in self.started_at:
+                n = self.failures.get(path, 0) + 1
+                self.failures[path] = n
+                delay = min(30 * 2 ** n, 3600)
+                self.next_allowed[path] = now + delay
+                self.started_at.pop(path, None)
+                sess = self.cfg.session_prefix + project.name
+                LOG.warning("server for %s exited (%d failures); retry in %ds. See %s, or run `claude` once "
+                            "in that folder if it stalled on the workspace-trust prompt.",
+                            path, n, delay, self.cfg.log_dir / f"{sess}.log")
+                continue
+            if now < self.next_allowed.get(path, 0):
+                continue
+            if self.stopping:
+                return  # a stop request arrived mid-rollout; leave the rest for the next daemon start
+            if started_any and not self.dry_run:
+                time.sleep(self.cfg.stagger_seconds)
+            try:
+                start(self.cfg, project, taken, self.dry_run)
+                if not self.dry_run:
+                    self.started_at[path] = time.monotonic()
+                started_any = True
+            except subprocess.CalledProcessError as exc:
+                LOG.error("tmux failed for %s: %s", path, exc)
+
+    def status(self) -> None:
+        desired = discover(self.cfg, self.hinted)
+        running = running_servers()
+        trusted = trusted_paths()
+        print(f"{'STATE':<10} {'PID':>7}  PATH")
+        for path in sorted(set(desired) | {p for p in running if p.parent in self.cfg.hot_paths}):
+            srv = running.get(path)
+            if path in desired and srv:
+                state = "running"
+            elif path in desired and path not in trusted:
+                state = "untrusted"
+            elif path in desired:
+                state = "missing"
+            else:
+                state = "stray"
+            print(f"{state:<10} {srv.pid if srv else '':>7}  {path}")
+
+    def trust(self, yes: bool) -> None:
+        desired = discover(self.cfg, self.hinted)
+        trusted = trusted_paths()
+        todo = sorted(p for p in desired if p not in trusted)
+        if not todo:
+            print("all tracked projects are already trusted")
+            return
+        print("Not yet trusted:")
+        for p in todo:
+            print(f"  {p}")
+        if not yes:
+            if not sys.stdin.isatty():
+                raise SystemExit("re-run with --yes to record trust for the folders above")
+            if input(f"Record workspace trust for these {len(todo)} folders in {CLAUDE_JSON}? [y/N] ").strip().lower() != "y":
+                raise SystemExit("aborted")
+        grant_trust(todo)
+        print(f"trusted {len(todo)} folder(s); backup at {CLAUDE_JSON.with_name('.claude.json.rc-daemon.bak')}")
+        print("the daemon picks them up on its next reconcile (within reconcile_interval)")
+
+    def run(self) -> None:
+        ino = Inotify()
+
+        def _sig(*_a):
+            self.stopping = True
+
+        signal.signal(signal.SIGTERM, _sig)
+        signal.signal(signal.SIGINT, _sig)
+
+        next_reconcile = time.monotonic()
+        while not self.stopping:
+            for hot in self.cfg.hot_paths:
+                if hot.is_dir():
+                    ino.add(hot)
+            now = time.monotonic()
+            if now >= next_reconcile:
+                try:
+                    self.reconcile()
+                except Exception:  # keep the loop alive; a bad scan must not kill the daemon
+                    LOG.exception("reconcile failed")
+                next_reconcile = time.monotonic() + self.cfg.reconcile_interval
+            timeout = max(0.0, next_reconcile - time.monotonic())
+            try:
+                ready, _, _ = select.select([ino.fd], [], [], timeout)
+            except InterruptedError:
+                continue
+            if ready and ino.drain():
+                # A sub-folder appeared/vanished: let git clone etc. settle, then reconcile early.
+                next_reconcile = min(next_reconcile, time.monotonic() + self.cfg.settle_seconds)
+        LOG.info("daemon exiting; remote-control servers keep running in tmux")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    ap.add_argument("--once", action="store_true", help="reconcile once and exit")
+    ap.add_argument("--dry-run", action="store_true", help="log actions without starting/stopping anything")
+    ap.add_argument("--status", action="store_true", help="print projects and their server state")
+    ap.add_argument("--trust", action="store_true",
+                    help="record workspace trust for every tracked project that lacks it (asks first)")
+    ap.add_argument("--yes", action="store_true", help="with --trust: do not ask")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+    if not args.config.exists():
+        raise SystemExit(f"config not found: {args.config}")
+    cfg = Config.load(args.config)
+    d = Daemon(cfg, args.dry_run)
+    if args.status:
+        d.status()
+    elif args.trust:
+        d.trust(args.yes)
+    elif args.once:
+        d.reconcile()
+    else:
+        d.run()
+
+
+if __name__ == "__main__":
+    main()

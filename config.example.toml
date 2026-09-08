@@ -1,0 +1,30 @@
+# claude-rc-daemon configuration.
+# Each hot path is watched (non-recursively); every immediate sub-folder that is a git
+# repository gets its own `claude remote-control` server in a tmux session named rc-<folder>.
+# A hot path is never a project itself, so listing ~/Projects/ZuraSolutions here both
+# tracks its children and stops ~/Projects from treating it as one.
+
+hot_paths = [
+  "~/Projects",
+  "~/Projects/ZuraSolutions",
+]
+
+# Sub-folders to ignore. A bare name matches in any hot path; a path matches exactly.
+# SideProjects holds older copies of top-level projects and is not a project itself.
+exclude = ["SideProjects"]
+
+# Only folders containing .git are projects. Set false to also serve plain folders (same-dir mode).
+require_git = true
+
+# Extra flags appended to every `claude remote-control` invocation.
+claude_args = ["--no-sandbox"]
+
+# session_prefix = "rc-"        # tmux session name prefix
+# settle_seconds = 10           # wait after a folder event before reconciling (lets git clone finish)
+# reconcile_interval = 60       # periodic full scan, catches anything inotify missed
+# stagger_seconds = 3           # pause between consecutive server starts
+# stop_grace_seconds = 10       # SIGINT, then SIGTERM after this long
+# log_dir = "~/.local/state/claude-rc-daemon/logs"   # each server's terminal output, rc-<folder>.log
+# settings_template = "~/.config/claude-rc-daemon/settings.local.json"
+#   Copied to <project>/.claude/settings.local.json when that file does not exist (never overwritten)
+#   and added to the project's .git/info/exclude. Set to "" to disable.

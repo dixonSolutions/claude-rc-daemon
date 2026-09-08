@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Remote Control per-project daemon (one server per folder under the hot paths)
+After=default.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-rc-daemon
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Restart=on-failure
+RestartSec=10
+# The servers live in tmux, not in this cgroup, so stopping the daemon leaves them running.
+KillMode=process
+
+[Install]
+WantedBy=default.target
