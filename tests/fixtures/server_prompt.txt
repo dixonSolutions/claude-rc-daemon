@@ -1,0 +1,3 @@
+Remote Control lets you access this session from claude.ai/code and the Claude mobile app.
+
+Enable Remote Control? (y/n) 

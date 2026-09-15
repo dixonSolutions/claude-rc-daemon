@@ -1,0 +1,6 @@
+Remote Control · GroqType
+
+·|· Reconnecting · retrying in 2.4s · disconnected 0s
+    Capacity: 0/32 · New sessions will be created in an isolated worktree
+
+space to show QR code

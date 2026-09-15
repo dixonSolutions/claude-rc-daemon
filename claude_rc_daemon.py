@@ -148,7 +148,8 @@ class Config:
     stagger_seconds: float = 3.0
     stop_grace_seconds: float = 10.0
     max_disconnected_seconds: float = 300.0
-    max_backoff_seconds: float = 600.0
+    max_backoff_seconds: float = 300.0
+    failing_after: int = 10
     network_probe: str = "api.anthropic.com:443"
     recovery_poll_seconds: float = 10.0
     max_log_bytes: int = 5_000_000
@@ -180,7 +181,8 @@ class Config:
             stagger_seconds=float(raw.get("stagger_seconds", 3)),
             stop_grace_seconds=float(raw.get("stop_grace_seconds", 10)),
             max_disconnected_seconds=float(raw.get("max_disconnected_seconds", 300)),
-            max_backoff_seconds=float(raw.get("max_backoff_seconds", 600)),
+            max_backoff_seconds=float(raw.get("max_backoff_seconds", 300)),
+            failing_after=int(raw.get("failing_after", 10)),
             network_probe=str(raw.get("network_probe", "api.anthropic.com:443")),
             recovery_poll_seconds=float(raw.get("recovery_poll_seconds", 10)),
             max_log_bytes=int(raw.get("max_log_bytes", 5_000_000)),
@@ -356,11 +358,14 @@ def session_of(pid: int, panes: dict[int, str]) -> str | None:
 
 
 def connection_state(sess: str) -> str | None:
-    """'connected' / 'disconnected' from the server's status line, or None when it says neither."""
+    """'connected' / 'disconnected' / 'prompt' from the server's screen, or None when it says none of them.
+    The wording is pinned by tests/fixtures (issue #4)."""
     r = subprocess.run(["tmux", "capture-pane", "-p", "-t", sess], capture_output=True, text=True)
     if r.returncode != 0:
         return None
     for line in reversed(_ANSI.sub("", r.stdout).splitlines()):
+        if "Enable Remote Control?" in line:
+            return "prompt"  # the one-time confirmation; the server serves nothing until it is answered
         if "Connected" in line or "Ready" in line:  # newer CLIs paint "✔ Ready · <name>" once linked
             return "connected"
         if "Reconnecting" in line or "disconnected" in line:
@@ -376,9 +381,26 @@ def connection_state(sess: str) -> str | None:
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
 CREDENTIALS = CLAUDE_DIR / ".credentials.json"
 AUTH_RECHECK_SECONDS = 1800  # re-ask `claude auth status` this often while held on a logout
+FAILING_RETRY_SECONDS = 3600  # retry pace for a folder marked failing
 AUTH_ERRORS = ("You must be logged in", "only available with claude.ai subscriptions")
 NETWORK_ERRORS = ("getaddrinfo", "ETIMEOUT", "ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET",
                   "ENETUNREACH", "EHOSTUNREACH", "Server unreachable", "timeout of", "socket hang up")
+# Refusals that no retry fixes: the server's environment has to change (issue #5).
+ENV_ERRORS = ("requires feature-flag evaluation", "requires claude.ai subscription auth",
+              "requires a claude.ai subscription", "requires a full-scope login token")
+# Variables that make `claude remote-control` refuse, or authenticate some way other than claude.ai.
+BLOCKING_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "DISABLE_GROWTHBOOK",
+                "DISABLE_TELEMETRY", "DO_NOT_TRACK", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+
+
+def environment_problems(env: dict[str, str] | os._Environ = os.environ) -> list[str]:
+    """Names of variables in `env` that can stop Remote Control."""
+    found = [v for v in BLOCKING_ENV if env.get(v)]
+    base = env.get("ANTHROPIC_BASE_URL", "")
+    if base and urllib.parse.urlsplit(base).hostname != "api.anthropic.com":
+        found.append("ANTHROPIC_BASE_URL")
+    return found
 
 
 def credentials_signature() -> tuple[int, int] | None:
@@ -430,22 +452,25 @@ def network_up(target: tuple[str, int], timeout: float = 5.0) -> bool:
     return bool(ok)
 
 
-def classify_exit(logfile: Path | None, offset: int) -> str:
-    """'auth', 'network' or 'crash', from what a server printed to its log since it was started."""
+def classify_exit(logfile: Path | None, offset: int) -> tuple[str, str]:
+    """('auth' | 'env' | 'network' | 'crash', the line that says why), from what a server printed to its
+    log since it was started."""
     if logfile is None:
-        return "crash"
+        return "crash", ""
     try:
         with open(logfile, "rb") as fh:
             size = fh.seek(0, os.SEEK_END)
             fh.seek(max(offset if offset <= size else 0, size - 65536))
             text = _ANSI.sub("", fh.read().decode(errors="replace"))
     except OSError:
-        return "crash"
-    if any(s in text for s in AUTH_ERRORS):
-        return "auth"
-    if any(s in text for s in NETWORK_ERRORS):
-        return "network"
-    return "crash"
+        return "crash", ""
+    lines = [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln.strip()]
+    for kind, needles in (("auth", AUTH_ERRORS), ("env", ENV_ERRORS), ("network", NETWORK_ERRORS)):
+        for ln in reversed(lines):
+            if any(s in ln for s in needles):
+                return kind, ln[:300]
+    errors = [ln for ln in lines if "Error" in ln]
+    return "crash", (errors or lines or [""])[-1][:300]
 
 
 # ---------------------------------------------------------------- remote control for every CLI session
@@ -566,6 +591,37 @@ def prompt_is_empty(pane: str) -> bool:
     return False
 
 
+def cli_link_state(pane: str) -> str | None:
+    """'active', 'connecting' or 'failed' from what a claude session shows about its Remote Control link."""
+    r = subprocess.run(["tmux", "capture-pane", "-p", "-t", pane], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    text = r.stdout
+    if "/rc failed" in text:
+        return "failed"
+    dead = max(text.rfind("/remote-control is no longer active"), text.rfind("Remote Control disconnected"))
+    if dead > text.rfind("/remote-control is active"):
+        return "failed"
+    if "/rc reconnecting" in text or "/rc connecting" in text:
+        return "connecting"
+    if "/rc active" in text:
+        return "active"
+    return None
+
+
+# ---------------------------------------------------------------- state shared with --status
+def state_file(cfg: Config) -> Path:
+    return cfg.log_dir.parent / "state.json"
+
+
+def read_state(cfg: Config) -> dict | None:
+    try:
+        data = json.loads(state_file(cfg).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 # ---------------------------------------------------------------- workspace trust
 def _read_claude_json() -> dict:
     try:
@@ -623,15 +679,18 @@ def server_command(cfg: Config, project: Project) -> list[str]:
 SETTINGS_LOCAL = Path(".claude") / "settings.local.json"
 
 
-def seed_settings(cfg: Config, project: Project, dry_run: bool) -> None:
-    """Copy the settings template to <project>/.claude/settings.local.json and git-exclude it.
-    A project's existing file holds its own choices and is never overwritten."""
+def seed_settings(cfg: Config, project: Project, dry_run: bool) -> str:
+    """Copy the settings template to <project>/.claude/settings.local.json and git-exclude it unless git
+    already ignores it. A project's existing file holds its own choices and is never overwritten.
+    Returns 'created', 'would-create', 'exists', 'no-template' or 'error'."""
     tpl, dest = cfg.settings_template, project.path / SETTINGS_LOCAL
-    if tpl is None or not tpl.is_file() or dest.exists():
-        return
+    if tpl is None or not tpl.is_file():
+        return "no-template"
+    if dest.exists():
+        return "exists"
     if dry_run:
         LOG.info("[dry-run] would seed %s from %s", dest, tpl)
-        return
+        return "would-create"
     try:
         dest.parent.mkdir(exist_ok=True)
         tmp = dest.with_name(dest.name + ".rc-daemon.tmp")
@@ -639,14 +698,16 @@ def seed_settings(cfg: Config, project: Project, dry_run: bool) -> None:
         os.replace(tmp, dest)
     except OSError as exc:
         LOG.warning("cannot seed %s: %s", dest, exc)
-        return
+        return "error"
     LOG.info("seeded %s from %s", dest, tpl)
     if not project.git:
-        return
-    r = subprocess.run(["git", "-C", str(project.path), "rev-parse", "--git-path", "info/exclude"],
-                       capture_output=True, text=True)
+        return "created"
+    git = ["git", "-C", str(project.path)]
+    if subprocess.run([*git, "check-ignore", "-q", str(SETTINGS_LOCAL)], capture_output=True).returncode == 0:
+        return "created"  # already ignored, e.g. by a global gitignore
+    r = subprocess.run([*git, "rev-parse", "--git-path", "info/exclude"], capture_output=True, text=True)
     if r.returncode != 0:
-        return
+        return "created"
     exclude, entry = project.path / r.stdout.strip(), f"/{SETTINGS_LOCAL}"
     try:
         text = exclude.read_text() if exclude.exists() else ""
@@ -656,6 +717,7 @@ def seed_settings(cfg: Config, project: Project, dry_run: bool) -> None:
                 fh.write(("" if not text or text.endswith("\n") else "\n") + entry + "\n")
     except OSError as exc:
         LOG.warning("cannot add %s to %s: %s", entry, exclude, exc)
+    return "created"
 
 
 def start(cfg: Config, project: Project, taken: set[str], dry_run: bool) -> tuple[Path | None, int]:
@@ -726,6 +788,14 @@ class Daemon:
         self.drift_deferred: set[Path] = set()
         self.convert_after: dict[int, float] = {}  # claude session pid -> earliest next conversion try
         self.not_in_tmux: set[int] = set()  # sessions already reported as unreachable
+        self.env_block: str | None = None  # a refusal only a changed environment fixes
+        self.env_warnings = [f"{v} is set in the daemon's environment and can stop Remote Control"
+                             for v in environment_problems()]
+        self.last_exit: dict[Path, tuple[str, str]] = {}  # why each project's server last exited
+        self.pane_of: dict[Path, str] = {}  # tmux session of each running server, from the last links()
+        self.answered_prompt: set[int] = set()  # server pids whose confirmation prompt was answered
+        self.unrecognised_passes = 0
+        self.wording_warned = False
 
     def desired(self) -> dict[Path, Project]:
         """Projects under the hot paths, plus the machine remote: one server for a folder of your
@@ -746,6 +816,9 @@ class Daemon:
 
     # ------------------------------------------------ preconditions
     def hold_reason(self) -> str | None:
+        if self.env_block is not None:
+            return (f"Remote Control refused in this environment ({self.env_block}); fix the service "
+                    "environment and restart the daemon")
         if self.login_ok is False:
             return "Claude Code is logged out -- run `claude auth login` (or /login in claude)"
         if not self.online and self.probe is not None:
@@ -780,6 +853,33 @@ class Daemon:
         return False
 
     def reconcile(self) -> None:
+        try:
+            self._reconcile()
+        finally:
+            self.write_state()
+
+    def write_state(self) -> None:
+        """Record holds, back-off and exit reasons for `--status`, which runs in another process."""
+        if self.dry_run:
+            return
+        now = time.monotonic()
+        data = {
+            "updated": time.time(), "pid": os.getpid(), "held": self.held, "env_warnings": self.env_warnings,
+            "projects": {str(p): {"failures": self.failures.get(p, 0),
+                                  "retry_in": max(0, int(self.next_allowed.get(p, 0) - now)),
+                                  "last_exit": list(self.last_exit[p]) if p in self.last_exit else None}
+                         for p in set(self.failures) | set(self.last_exit)},
+        }
+        path = state_file(self.cfg)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(data, indent=1) + "\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            LOG.warning("cannot write %s: %s", path, exc)
+
+    def _reconcile(self) -> None:
         ensure_remote_at_startup(self.cfg.remote_all_sessions, self.dry_run)
         self.preflight()
         desired = self.desired()
@@ -838,10 +938,16 @@ class Daemon:
                     self.next_allowed.pop(path, None)
                     self.started_at.pop(path, None)
                     self.logs.pop(path, None)
+                    self.last_exit.pop(path, None)
                 continue
             self.started_at.pop(path)
             logfile, offset, sig = self.logs.pop(path, (None, 0, None))
-            kind = classify_exit(logfile, offset)
+            kind, why = classify_exit(logfile, offset)
+            self.last_exit[path] = (kind, why)
+            if kind == "env":
+                LOG.error("server for %s exited: %s", path, why)
+                self.env_block = why
+                continue
             if kind == "auth":
                 LOG.info("server for %s exited: not logged in", path)
                 if sig == credentials_signature():  # a login since this start would make it retryable
@@ -858,10 +964,15 @@ class Daemon:
             n = self.failures.get(path, 0) + 1
             self.failures[path] = n
             delay = min(30 * 2 ** n, self.cfg.max_backoff_seconds)
+            if 0 < self.cfg.failing_after <= n:
+                delay = max(delay, FAILING_RETRY_SECONDS)
+                if n == self.cfg.failing_after:
+                    LOG.error("server for %s has failed %d times in a row; marking it failing and retrying only "
+                              "hourly. Last output: %s (full log: %s)", path, n, why or "none",
+                              logfile or self.cfg.log_dir)
             self.next_allowed[path] = now + delay
-            LOG.warning("server for %s exited (%s, %d failures); retry in %ds. See %s, or run `claude` once "
-                        "in that folder if it stalled on the workspace-trust prompt.",
-                        path, kind, n, delay, logfile or self.cfg.log_dir)
+            LOG.warning("server for %s exited (%s, %d failures): %s; retry in %ds. See %s",
+                        path, kind, n, why or "no output", delay, logfile or self.cfg.log_dir)
         if self.note_hold() is not None:
             return  # nothing started now would stay up; preflight polls for the recovery
         if self.cfg.convert_sessions:
@@ -888,20 +999,23 @@ class Daemon:
                 LOG.error("tmux failed for %s: %s", path, exc)
 
     def convert_open_sessions(self) -> None:
-        """Turn on Remote Control in interactive `claude` sessions that are running without it."""
-        local = [s for s in cli_sessions() if not s.remote]
-        live = {s.pid for s in local}
+        """Turn on Remote Control in interactive `claude` sessions that run without it, and turn it back on
+        in sessions whose link has failed ("/rc failed", "/remote-control is no longer active")."""
+        sessions = cli_sessions()
+        live = {s.pid for s in sessions}
         self.convert_after = {p: t for p, t in self.convert_after.items() if p in live}
         self.not_in_tmux &= live
-        if not local:
+        if not sessions:
             return
         now = time.monotonic()
-        # Server panes need no filter: cli_sessions() skips servers, and their sessions are remote.
-        pane_ids = {pid: pane for pid, (pane, _sess) in _panes().items()}
-        for s in local:
+        pane_ids = {pid: pane for pid, (pane, _sess) in _panes().items()}  # cli_sessions() already skips servers
+        for s in sessions:
             if now < self.convert_after.get(s.pid, 0):
                 continue
             pane = session_of(s.pid, pane_ids)
+            if s.remote and (pane is None or cli_link_state(pane) != "failed"):
+                continue  # linked, or out of reach: a session outside tmux cannot be repaired from here
+            action = "re-enabled Remote Control (its link had failed)" if s.remote else "enabled Remote Control"
             if pane is None:
                 if s.pid not in self.not_in_tmux:
                     self.not_in_tmux.add(s.pid)
@@ -911,14 +1025,13 @@ class Daemon:
             if s.status != "idle" or not prompt_is_empty(pane):
                 continue  # busy, waiting on a dialog, or you are typing: try again next pass
             if self.dry_run:
-                LOG.info("[dry-run] would enable Remote Control in claude session pid %d (%s, tmux %s)",
-                         s.pid, s.cwd, pane)
+                LOG.info("[dry-run] %s in claude session pid %d (%s, tmux %s)", action, s.pid, s.cwd, pane)
                 continue
             subprocess.run(["tmux", "send-keys", "-t", pane, "-l", "/remote-control"], check=False)
             time.sleep(0.5)  # let the slash-command menu settle before Enter picks it
             subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=False)
             self.convert_after[s.pid] = now + 600  # if it does not take, retry later rather than every pass
-            LOG.info("enabled Remote Control in claude session pid %d (%s, tmux %s)", s.pid, s.cwd, pane)
+            LOG.info("%s in claude session pid %d (%s, tmux %s)", action, s.pid, s.cwd, pane)
 
     def apply_config_changes(self, running: dict[Path, Server], desired: dict[Path, Project]) -> None:
         """Restart servers whose command line no longer matches the config (capacity, permission_mode,
@@ -944,8 +1057,38 @@ class Daemon:
         out: dict[Path, str | None] = {}
         for cwd, srv in running.items():
             sess = session_of(srv.pid, panes)
+            if sess:
+                self.pane_of[cwd] = sess
             out[cwd] = connection_state(sess) if sess else None
         return out
+
+    def answer_prompt(self, cwd: Path, srv: Server) -> None:
+        """A server waiting on "Enable Remote Control? (y/n)" serves nothing until someone answers. Serving the
+        folder is what the daemon is configured for, so it answers yes -- once per server process."""
+        sess = self.pane_of.get(cwd)
+        if sess is None or srv.pid in self.answered_prompt:
+            return
+        self.answered_prompt.add(srv.pid)
+        if self.dry_run:
+            LOG.info("[dry-run] would answer the Remote Control confirmation for %s", cwd)
+            return
+        subprocess.run(["tmux", "send-keys", "-t", sess, "y", "Enter"], check=False)
+        LOG.info("answered the Remote Control confirmation prompt for %s", cwd)
+
+    def check_wording(self, states: dict[Path, str | None]) -> None:
+        """Stall detection reads status text Claude Code paints for people (issue #4). If no server shows a
+        recognised line for three passes in a row, the wording has probably moved: say so once."""
+        if not states:
+            return
+        if any(s is not None for s in states.values()):
+            self.unrecognised_passes = 0
+            return
+        self.unrecognised_passes += 1
+        if self.unrecognised_passes >= 3 and not self.wording_warned:
+            self.wording_warned = True
+            LOG.warning("none of the %d servers shows a status line this daemon recognises (Ready / Connected / "
+                        "Reconnecting); Claude Code may have changed its wording, so stalled servers will not be "
+                        "restarted. Compare `tmux capture-pane -p -t <session>` with tests/fixtures.", len(states))
 
     def check_connections(self, running: dict[Path, Server], now: float) -> None:
         """Restart servers whose process is alive but whose link to Claude is not.
@@ -956,9 +1099,14 @@ class Daemon:
         reconcile starts a fresh one. A pane that says neither (trust prompt, error, startup) is
         left alone -- only an explicit reconnect loop counts.
         """
-        if self.cfg.max_disconnected_seconds <= 0:
-            return
-        for cwd, state in self.links(running).items():
+        states = self.links(running)
+        self.check_wording(states)
+        for cwd, state in states.items():
+            if state == "prompt":
+                self.answer_prompt(cwd, running[cwd])
+                continue
+            if self.cfg.max_disconnected_seconds <= 0:
+                continue
             if state != "disconnected":
                 since = self.disconnected_since.pop(cwd, None)
                 if since is not None and state == "connected":
@@ -981,20 +1129,41 @@ class Daemon:
         links = self.links(running)
         login = logged_in()
         net = "unchecked" if self.probe is None else ("up" if network_up(self.probe) else "DOWN")
-        print(f"login: {'yes' if login else 'NO' if login is False else 'unknown'}    network: {net}\n")
-        print(f"{'STATE':<10} {'LINK':<12} {'PID':>7}  PATH")
+        print(f"login: {'yes' if login else 'NO' if login is False else 'unknown'}    network: {net}")
+        st = read_state(self.cfg)
+        if st is None:
+            print("daemon: no state recorded -- is the service running?")
+        else:
+            age = int(time.time() - float(st.get("updated", 0)))
+            stale = " -- STALE, is the service running?" if age > 3 * self.cfg.reconcile_interval + 60 else ""
+            held = st.get("held")
+            print(f"daemon: {'HOLDING: ' + held if held else 'ok'} (last reconcile {age}s ago{stale})")
+            for warning in st.get("env_warnings") or []:
+                print(f"warning: {warning}")
+        projects = (st or {}).get("projects") or {}
+        print(f"\n{'STATE':<10} {'LINK':<12} {'PID':>7}  PATH")
         for path in sorted(set(desired) | {p for p in running if p.parent in self.cfg.hot_paths}):
             srv = running.get(path)
             link = links.get(path) or ("" if srv is None else "unknown")
+            info = projects.get(str(path)) or {}
+            failures = int(info.get("failures") or 0)
             if path in desired and srv:
-                state = "stalled" if link == "disconnected" else "running"
+                state = {"disconnected": "stalled", "prompt": "prompt"}.get(link, "running")
             elif path in desired and path not in trusted:
                 state = "untrusted"
+            elif path in desired and 0 < self.cfg.failing_after <= failures:
+                state = "failing"
+            elif path in desired and failures:
+                state = "backoff"
             elif path in desired:
                 state = "missing"
             else:
                 state = "stray"
             print(f"{state:<10} {link:<12} {srv.pid if srv else '':>7}  {path}")
+            if srv is None and info.get("last_exit"):
+                kind, why = info["last_exit"]
+                retry = f", retry in {info.get('retry_in', 0)}s" if failures else ""
+                print(f"{'':<32}last exit ({kind}{retry}): {why or 'no output'}")
 
     def trust(self, yes: bool) -> None:
         desired = self.desired()
@@ -1015,8 +1184,21 @@ class Daemon:
         print(f"trusted {len(todo)} folder(s); backup at {CLAUDE_JSON.with_name('.claude.json.rc-daemon.bak')}")
         print("the daemon picks them up on its next reconcile (within reconcile_interval)")
 
+    def seed_all(self) -> None:
+        """`--seed-settings`: seed the settings template into every tracked project now (issue #1)."""
+        tpl = self.cfg.settings_template
+        if tpl is None or not tpl.is_file():
+            raise SystemExit(f"no settings template at {tpl}; set settings_template in the config")
+        counts: dict[str, int] = {}
+        for project in sorted(self.desired().values(), key=lambda p: p.path):
+            result = seed_settings(self.cfg, project, self.dry_run)
+            counts[result] = counts.get(result, 0) + 1
+        print(", ".join(f"{n} {k}" for k, n in sorted(counts.items())) or "no tracked projects")
+
     def run(self) -> None:
         ino = Inotify()
+        for warning in self.env_warnings:
+            LOG.warning(warning)
 
         def _sig(*_a):
             self.stopping = True
@@ -1076,6 +1258,9 @@ def main() -> None:
     ap.add_argument("--trust", action="store_true",
                     help="record workspace trust for every tracked project that lacks it (asks first)")
     ap.add_argument("--yes", action="store_true", help="with --trust: do not ask")
+    ap.add_argument("--seed-settings", action="store_true",
+                    help="copy the settings template into every tracked project that lacks "
+                         ".claude/settings.local.json (never overwrites; honours --dry-run)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1088,6 +1273,8 @@ def main() -> None:
         d.status()
     elif args.trust:
         d.trust(args.yes)
+    elif args.seed_settings:
+        d.seed_all()
     elif args.once:
         d.reconcile()
     else:

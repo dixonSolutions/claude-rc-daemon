@@ -57,7 +57,8 @@ auto_trust = true
 #   A server that loses its link to Claude retries forever without exiting, so its process
 #   stays healthy while the device reads "offline" in claude.ai/code. After this many
 #   seconds of an unbroken reconnect loop the daemon restarts it. 0 disables the check.
-# max_backoff_seconds = 600     # longest wait before retrying a server that keeps crashing
+# max_backoff_seconds = 300     # longest wait before retrying a server that keeps crashing
+# failing_after = 10            # crashes in a row before a folder is marked failing (logged, hourly retries)
 # network_probe = "api.anthropic.com:443"
 #   TCP-connected before starting servers (through HTTPS_PROXY when set). While it fails, and while
 #   Claude Code is logged out, starts are held instead of piling up back-off; once both are back,

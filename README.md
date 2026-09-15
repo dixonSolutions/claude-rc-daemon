@@ -31,14 +31,27 @@ tells these apart from crashes by reading the server's log:
   `~/.claude/.credentials.json` changes, so the servers come back seconds after you log in.
 - **Network down**: starts are held while `api.anthropic.com:443` is unreachable. It re-checks
   every 10 s and restarts everything once the connection works again.
-- **Crash**: normal exponential back-off, capped at `max_backoff_seconds` (default 10 min).
-  Recovering from a logout or an outage also clears this back-off.
+- **Crash**: exponential back-off per folder, capped at `max_backoff_seconds` (default 5 min), so
+  one broken project never delays the others. After `failing_after` (10) crashes in a row the folder
+  is marked **failing**: one error in the journal with its last output, `failing` in `--status`, and
+  retries drop to hourly. Recovering from a logout or an outage clears all back-off.
+- **Environment refusal**: a server that exits because of its environment (`DISABLE_GROWTHBOOK`
+  set, API-key auth instead of claude.ai, a long-lived token without full scope) holds every start
+  until the daemon restarts, since retrying cannot help. Variables known to cause this are named in
+  the journal at startup and in `--status`.
+- **Stuck on a prompt**: a server waiting on the one-time "Enable Remote Control? (y/n)" question
+  is answered yes.
 - **Reboot**: linger starts the daemon at boot, and starts wait until the network is up.
 - **Daemon dies**: systemd restarts it (`Restart=always`, no start limit). The servers keep running
   in tmux and are adopted again.
 
 A restarted server reconnects the sessions it had before. Claude Code keeps the environment
 ("Environment preserved. Restart `claude remote-control` to reconnect existing sessions").
+`claude remote-control --continue` is not used: Claude Code rejects it together with `--spawn` and
+`--capacity`, which every server here needs.
+
+`--status` shows why a folder is down: the last exit reason (`auth`, `env`, `network`, `crash`)
+with the line the server printed, the retry countdown, and any hold on the whole daemon.
 
 ## Stack
 
@@ -67,9 +80,10 @@ approve folders yourself with `claude-rc-daemon --trust`, which lists them and a
 ## Daily use
 
 ```bash
-claude-rc-daemon --status            # running / stalled / untrusted / missing / stray, per folder
+claude-rc-daemon --status            # running / stalled / prompt / failing / backoff / untrusted / missing / stray
                                      # LINK column is the live connection: connected / disconnected
 claude-rc-daemon --trust             # only needed when auto_trust = false
+claude-rc-daemon --seed-settings     # copy the settings template where missing (add --dry-run to preview)
 journalctl --user -u claude-rc-daemon -f
 ls ~/.local/state/claude-rc-daemon/logs/   # each server's terminal output
 tmux attach -t rc-<folder>           # the server's own screen (QR code, session link)
@@ -112,6 +126,9 @@ Project servers cover claude.ai/code. Sessions you open yourself in a terminal a
   session's tmux pane. It only does so when the session is idle and nothing is typed in the prompt,
   and waits otherwise. Sessions outside tmux can't be switched from outside, because terminal input
   injection (TIOCSTI) is disabled on current kernels. The daemon names them in the journal once.
+- A session whose link has died shows `/rc failed` or "/remote-control is no longer active". If it
+  runs in tmux, the daemon turns Remote Control on again the same way. Outside tmux it can't, so start
+  long-lived sessions in tmux (`tmux new -s work`, then `claude`).
 
 Changing `capacity`, `permission_mode`, `spawn_mode` or `claude_args` takes effect without a manual restart. Idle
 servers whose command line no longer matches the config are restarted on the next reconcile. A
@@ -130,7 +147,19 @@ The daemon seeds that file into every served project that has no `.claude/settin
 yet and adds it to the project's `.git/info/exclude`. An existing file holds that project's own
 choices and is never overwritten. Add `"defaultMode": "auto"` under `permissions` in the template
 to make new sessions start in that mode, or set `permission_mode` in the config to force it for
-every project. Set `settings_template = ""` to turn seeding off.
+every project. Set `settings_template = ""` to turn seeding off. `claude-rc-daemon --seed-settings`
+does the same on demand and prints how many files it created and skipped.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Stall detection and session conversion read text that Claude Code paints for people, which can
+change in any release. `tests/fixtures` holds screens recorded from Claude Code 2.1.271–2.1.272, so a wording
+change fails a test once the fixtures are refreshed. In the field, the daemon also logs a warning when
+no server shows a status line it recognises.
 
 ## Files
 
@@ -141,3 +170,4 @@ every project. Set `settings_template = ""` to turn seeding off.
 | `settings.local.example.json` | per-project Claude Code permissions template |
 | `claude-rc-daemon.service` | systemd user unit |
 | `install.sh` | link, copy, enable |
+| `tests/` | unit tests and recorded Claude Code screens |
