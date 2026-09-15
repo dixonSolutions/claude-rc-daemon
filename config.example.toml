@@ -37,6 +37,12 @@ remote_all_sessions = true
 # sessions inside tmux, typed as /remote-control only while the session is idle with an empty prompt.
 convert_sessions = true
 
+# The remote for this machine: one extra server for a whole folder, named after the machine (hostname
+# unless machine_remote_name is set). A hot path is never served as a project on its own; this keeps
+# one served. Not your home directory: Claude Code never saves trust for it. Unset: no machine remote.
+# machine_remote = "~/Projects"
+# machine_remote_name = ""
+
 # Accept the Claude Code workspace-trust dialog automatically for every project folder found
 # directly inside a hot path. Listing the hot path is the opt-in. Without this, new folders sit
 # in "untrusted" until you run `claude-rc-daemon --trust`.

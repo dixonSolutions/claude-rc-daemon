@@ -157,6 +157,8 @@ class Config:
     spawn_mode: str = "worktree"
     remote_all_sessions: bool | None = None
     convert_sessions: bool = False
+    machine_remote: Path | None = None
+    machine_remote_name: str = ""
     restart_on_config_change: bool = True
     log_dir: Path = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "claude-rc-daemon" / "logs"
     settings_template: Path | None = DEFAULT_CONFIG.with_name("settings.local.json")
@@ -187,6 +189,8 @@ class Config:
             spawn_mode=_choice(raw.get("spawn_mode", "worktree"), "spawn_mode", ("worktree", "same-dir", "session")),
             remote_all_sessions=None if raw.get("remote_all_sessions") is None else bool(raw["remote_all_sessions"]),
             convert_sessions=bool(raw.get("convert_sessions", False)),
+            machine_remote=Path(raw["machine_remote"]).expanduser().resolve() if raw.get("machine_remote") else None,
+            machine_remote_name=str(raw.get("machine_remote_name", "")),
             restart_on_config_change=bool(raw.get("restart_on_config_change", True)),
             auto_trust=bool(raw.get("auto_trust", False)),
             **({"log_dir": Path(raw["log_dir"]).expanduser()} if "log_dir" in raw else {}),
@@ -209,10 +213,11 @@ class Config:
 class Project:
     path: Path
     git: bool
+    label: str = ""  # shown in claude.ai/code instead of the folder name
 
     @property
     def name(self) -> str:
-        return self.path.name
+        return self.label or self.path.name
 
     def spawn(self, mode: str) -> str:
         """The configured spawn mode; worktree needs a git repo, so plain folders fall back to same-dir."""
@@ -722,6 +727,23 @@ class Daemon:
         self.convert_after: dict[int, float] = {}  # claude session pid -> earliest next conversion try
         self.not_in_tmux: set[int] = set()  # sessions already reported as unreachable
 
+    def desired(self) -> dict[Path, Project]:
+        """Projects under the hot paths, plus the machine remote: one server for a folder of your
+        choice (often a hot path itself, which is never discovered as a project), named after this
+        machine so claude.ai/code can start sessions there, not only inside a single project."""
+        found = discover(self.cfg, self.hinted)
+        m = self.cfg.machine_remote
+        if m is None or not m.is_dir():
+            return found
+        if m == Path.home():
+            if m not in self.hinted:
+                self.hinted.add(m)
+                LOG.warning("machine_remote cannot be your home directory: Claude Code never saves trust for "
+                            "it, so the server would exit. Use a folder such as ~/Projects.")
+            return found
+        found[m] = Project(m, _is_git(m), self.cfg.machine_remote_name or socket.gethostname())
+        return found
+
     # ------------------------------------------------ preconditions
     def hold_reason(self) -> str | None:
         if self.login_ok is False:
@@ -760,7 +782,7 @@ class Daemon:
     def reconcile(self) -> None:
         ensure_remote_at_startup(self.cfg.remote_all_sessions, self.dry_run)
         self.preflight()
-        desired = discover(self.cfg, self.hinted)
+        desired = self.desired()
         running = running_servers()
         now = time.monotonic()
         taken = tmux_sessions()
@@ -953,7 +975,7 @@ class Daemon:
                 self.disconnected_since.pop(cwd, None)
 
     def status(self) -> None:
-        desired = discover(self.cfg, self.hinted)
+        desired = self.desired()
         running = running_servers()
         trusted = trusted_paths()
         links = self.links(running)
@@ -975,7 +997,7 @@ class Daemon:
             print(f"{state:<10} {link:<12} {srv.pid if srv else '':>7}  {path}")
 
     def trust(self, yes: bool) -> None:
-        desired = discover(self.cfg, self.hinted)
+        desired = self.desired()
         trusted = trusted_paths()
         todo = sorted(p for p in desired if p not in trusted)
         if not todo:

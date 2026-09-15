@@ -91,6 +91,14 @@ remote_all_sessions = true          # every interactive `claude` starts with Rem
 convert_sessions = true             # also switch on already-open sessions (tmux only)
 ```
 
+## The machine remote
+
+A hot path such as `~/Projects` is never served as a project, so there is no remote for the folder
+itself unless you set `machine_remote = "~/Projects"`. The daemon then keeps one extra server there
+under the machine's hostname (or `machine_remote_name`), with the same logout, outage and restart
+handling as project servers. Plain folders use `same-dir` sessions. The home directory can't be used,
+because Claude Code never saves trust for it.
+
 ## Every Claude session remoted
 
 Project servers cover claude.ai/code. Sessions you open yourself in a terminal are covered too:
