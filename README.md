@@ -41,6 +41,10 @@ tells these apart from crashes by reading the server's log:
   the journal at startup and in `--status`.
 - **Stuck on a prompt**: a server waiting on the one-time "Enable Remote Control? (y/n)" question
   is answered yes.
+- **Account switch**: a server stays registered under the account it started with, and only a Claude
+  app signed in to that same account lists it. When `claude auth login` signs in to a different
+  account, the daemon restarts every server so they register under the new one. That also works if
+  the switch happened while the daemon was down. `--status` shows the account (`login: yes as …`).
 - **Reboot**: linger starts the daemon at boot, and starts wait until the network is up.
 - **Daemon dies**: systemd restarts it (`Restart=always`, no start limit). The servers keep running
   in tmux and are adopted again.

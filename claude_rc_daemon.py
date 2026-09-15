@@ -637,6 +637,14 @@ def trusted_paths() -> set[Path]:
     return {Path(p) for p, v in projects.items() if isinstance(v, dict) and v.get("hasTrustDialogAccepted") is True}
 
 
+def claude_account() -> tuple[str, str] | None:
+    """(account uuid, email) Claude Code is signed in as. Servers register under this account, and only a
+    Claude app signed in to the same account lists them."""
+    a = _read_claude_json().get("oauthAccount") or {}
+    uuid = a.get("accountUuid") if isinstance(a, dict) else None
+    return (str(uuid), str(a.get("emailAddress") or "")) if uuid else None
+
+
 def grant_trust(paths: list[Path]) -> None:
     """Record trust for the given folders, exactly as accepting the dialog in each would.
     Invoked by the explicit `--trust` command, or by the loop when `auto_trust = true`."""
@@ -796,6 +804,11 @@ class Daemon:
         self.answered_prompt: set[int] = set()  # server pids whose confirmation prompt was answered
         self.unrecognised_passes = 0
         self.wording_warned = False
+        # The account servers were last started under. Kept in the state file so an account switched while
+        # the daemon was down is still noticed.
+        self.account: str | None = (read_state(cfg) or {}).get("account_uuid")
+        self.account_email: str | None = None
+        self.account_changed = False
 
     def desired(self) -> dict[Path, Project]:
         """Projects under the hot paths, plus the machine remote: one server for a folder of your
@@ -842,6 +855,13 @@ class Daemon:
             self.creds_sig = sig
             self.login_ok = logged_in()
             self.login_recheck_at = now + AUTH_RECHECK_SECONDS
+        account = claude_account()
+        if account is not None:
+            if self.account is not None and account[0] != self.account:
+                LOG.warning("Claude Code is now signed in as %s (account %s, was %s); restarting every server so "
+                            "it registers under that account", account[1] or "?", account[0], self.account)
+                self.account_changed = True
+            self.account, self.account_email = account
         if self.probe is not None:
             self.online = network_up(self.probe)
         self.note_hold()
@@ -865,6 +885,7 @@ class Daemon:
         now = time.monotonic()
         data = {
             "updated": time.time(), "pid": os.getpid(), "held": self.held, "env_warnings": self.env_warnings,
+            "account_uuid": self.account, "account_email": self.account_email,
             "projects": {str(p): {"failures": self.failures.get(p, 0),
                                   "retry_in": max(0, int(self.next_allowed.get(p, 0) - now)),
                                   "last_exit": list(self.last_exit[p]) if p in self.last_exit else None}
@@ -919,6 +940,15 @@ class Daemon:
                                    and cwd not in self.cfg.hot_paths):
                 stop(srv, self.cfg, self.dry_run)
                 stopped.add(cwd)
+
+        # A server keeps the account it registered under until it restarts, so after a sign-in to another
+        # account every server would stay listed only under the old one.
+        if self.account_changed and self.held is None:
+            self.account_changed = False
+            for cwd, srv in running.items():
+                if cwd in desired and cwd not in stopped:
+                    stop(srv, self.cfg, self.dry_run, why="Claude Code account changed")
+                    stopped.add(cwd)
 
         # A running process is not an online device: restart the ones stuck reconnecting. Not while
         # held -- a fresh server could not connect either; the old one's own retry loop is better.
@@ -1129,7 +1159,9 @@ class Daemon:
         links = self.links(running)
         login = logged_in()
         net = "unchecked" if self.probe is None else ("up" if network_up(self.probe) else "DOWN")
-        print(f"login: {'yes' if login else 'NO' if login is False else 'unknown'}    network: {net}")
+        account = claude_account()
+        signed_in = f" as {account[1] or account[0]}" if account else ""
+        print(f"login: {'yes' + signed_in if login else 'NO' if login is False else 'unknown'}    network: {net}")
         st = read_state(self.cfg)
         if st is None:
             print("daemon: no state recorded -- is the service running?")

@@ -232,8 +232,10 @@ class HoldAndRecovery(unittest.TestCase):
     def setUp(self):
         logging.disable(logging.CRITICAL)
         self.tmp = tempfile.TemporaryDirectory()
-        self.world = {"login": True, "online": True, "sig": (1, 1), "running": set(), "exit": ("crash", "Error: boom")}
+        self.world = {"login": True, "online": True, "sig": (1, 1), "running": set(), "exit": ("crash", "Error: boom"),
+                      "account": ("old-uuid", "old@example.com")}
         self.started: list[str] = []
+        self.stopped: list[tuple[str, str | None]] = []
         w = self.world
         projects = {Path(f"/p/{n}"): d.Project(Path(f"/p/{n}"), True) for n in ("a", "b")}
 
@@ -247,7 +249,9 @@ class HoldAndRecovery(unittest.TestCase):
             network_up=lambda target, timeout=5.0: w["online"], credentials_signature=lambda: w["sig"],
             running_servers=lambda: {p: d.Server(1, p, False) for p in w["running"]},
             start=start, classify_exit=lambda logfile, offset: w["exit"],
-            seed_settings=lambda *a: "exists", ensure_remote_at_startup=lambda *a: None)
+            seed_settings=lambda *a: "exists", ensure_remote_at_startup=lambda *a: None,
+            claude_account=lambda: w["account"],
+            stop=lambda srv, cfg, dry_run, why=None: self.stopped.append((srv.cwd.name, why)))
         self.patcher.start()
         cfg = d.Config(hot_paths=[Path("/p")], stagger_seconds=0, log_dir=Path(self.tmp.name) / "logs")
         self.dm = d.Daemon(cfg, dry_run=False)
@@ -301,6 +305,27 @@ class HoldAndRecovery(unittest.TestCase):
         self.assertIn("environment", self.dm.held)
         self.world["sig"] = (3, 3)
         self.assertEqual(self.step(), [])
+
+    def test_account_switch_restarts_every_server_once(self):
+        self.world["running"] = {Path("/p/a"), Path("/p/b")}
+        self.step()
+        self.assertEqual(self.stopped, [])
+        self.world["account"] = ("new-uuid", "new@example.com")
+        self.step()
+        self.assertEqual(sorted(self.stopped), [("a", "Claude Code account changed"), ("b", "Claude Code account changed")])
+        self.stopped.clear()
+        self.step()
+        self.assertEqual(self.stopped, [])
+
+    def test_account_switch_while_daemon_was_down_is_noticed(self):
+        self.world["running"] = {Path("/p/a")}
+        self.step()  # records old-uuid in the state file
+        self.world["account"] = ("new-uuid", "new@example.com")
+        restarted = d.Daemon(self.dm.cfg, dry_run=False)
+        restarted.check_connections = lambda running, now: None
+        restarted.apply_config_changes = lambda running, desired: None
+        restarted.reconcile()
+        self.assertEqual(self.stopped, [("a", "Claude Code account changed")])
 
     def test_crash_backs_off_per_folder_and_marks_failing(self):
         self.dm.cfg.failing_after = 3
