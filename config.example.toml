@@ -17,6 +17,26 @@ require_git = true
 # Extra flags appended to every `claude remote-control` invocation.
 claude_args = ["--no-sandbox"]
 
+# Max concurrent sessions per project server (`claude remote-control --capacity`).
+capacity = 32
+
+# Permission mode for sessions spawned from claude.ai/code (`--permission-mode`): acceptEdits, auto,
+# bypassPermissions, default, dontAsk, plan. "" leaves each project's own settings in charge.
+permission_mode = ""
+
+# How project servers run sessions: "worktree" (each session gets its own git worktree; plain folders
+# fall back to same-dir), "same-dir" (all sessions share the folder), "session" (one session only).
+spawn_mode = "worktree"
+
+# Every interactive `claude` session starts with Remote Control on. The daemon keeps
+# remoteControlAtStartup = true in ~/.claude/settings.json. false forces it off; delete the line to
+# leave the setting alone.
+remote_all_sessions = true
+
+# Also switch on Remote Control in claude sessions that are already open without it. Works for
+# sessions inside tmux, typed as /remote-control only while the session is idle with an empty prompt.
+convert_sessions = true
+
 # Accept the Claude Code workspace-trust dialog automatically for every project folder found
 # directly inside a hot path. Listing the hot path is the opt-in. Without this, new folders sit
 # in "untrusted" until you run `claude-rc-daemon --trust`.
@@ -27,6 +47,20 @@ auto_trust = true
 # reconcile_interval = 60       # periodic full scan, catches anything inotify missed
 # stagger_seconds = 3           # pause between consecutive server starts
 # stop_grace_seconds = 10       # SIGINT, then SIGTERM after this long
+# max_disconnected_seconds = 300
+#   A server that loses its link to Claude retries forever without exiting, so its process
+#   stays healthy while the device reads "offline" in claude.ai/code. After this many
+#   seconds of an unbroken reconnect loop the daemon restarts it. 0 disables the check.
+# max_backoff_seconds = 600     # longest wait before retrying a server that keeps crashing
+# network_probe = "api.anthropic.com:443"
+#   TCP-connected before starting servers (through HTTPS_PROXY when set). While it fails, and while
+#   Claude Code is logged out, starts are held instead of piling up back-off; once both are back,
+#   every server restarts. "" disables the network check.
+# recovery_poll_seconds = 10    # how often to re-check login/network while starts are held
+# max_log_bytes = 5000000       # a server log larger than this is rotated to .log.1 on the next start
+# restart_on_config_change = true
+#   Restart idle servers whose flags no longer match this file (capacity, permission_mode, claude_args).
+#   Servers with sessions attached are restarted once they are idle.
 # log_dir = "~/.local/state/claude-rc-daemon/logs"   # each server's terminal output, rc-<folder>.log
 # settings_template = "~/.config/claude-rc-daemon/settings.local.json"
 #   Copied to <project>/.claude/settings.local.json when that file does not exist (never overwritten)
